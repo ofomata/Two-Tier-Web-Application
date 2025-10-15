@@ -1,0 +1,628 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Two Tier Web-Application Lift and Shift from on prem to AWS with High Availability Configuration
+
+Parameters:
+  EnvironmentName:
+    Description: Short name used in resource names/tags
+    Type: String
+    Default: Prod
+  VpcCidrBlock:
+    Description: CidrBlock for VPC
+    Type: String
+    Default: 10.0.0.0/16
+    AllowedValues:
+      - 10.0.0.0/16
+      - 10.1.0.0/16
+  publicACidr:
+    Type: String
+    Default: 10.0.1.0/24
+  publicBCidr:
+    Type: String
+    Default: 10.0.2.0/24
+  privateACidr:
+    Type: String
+    Default: 10.0.3.0/24
+  privateBCidr:
+    Type: String
+    Default: 10.0.4.0/24
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Default: <YOUR KEYPAIRNAME>
+    Description: Key pair for SSH access
+  DBName:
+    Type: String
+    Default: bookstore
+    Description: Database name
+  SSHAccessCidr:
+    Description: CIDR for SSH access to the web servers (port 22)
+    Type: String
+    Default: 10.0.0.0/16 # Defaulting to VPC CIDR for secure internal access
+  AppHostedZone:
+    Type: String
+    Default: <YOUR HOSTED ZONE ID>   # replace with your actual hosted zone ID
+    Description: "Existing Route 53 hosted zone ID for hendrix.it.com"
+  GoldenAMI:
+    Type: String
+    Default: <YOUR GOLDEN AMI>
+  SecondaryAMI:
+    Type: String
+    Default: <YOUR SECONDARY AMI>
+    
+Resources:
+  AppVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidrBlock
+      EnableDnsHostnames: True
+      EnableDnsSupport: True
+      Tags: 
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-vpc"
+
+  VpcInternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+      - Key: Name
+        Value: !Sub "${EnvironmentName}-igw"
+
+  IGWAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref VpcInternetGateway
+      VpcId: !Ref AppVPC
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref AppVPC
+      CidrBlock: !Ref publicACidr
+      AvailabilityZone: "us-east-1a"
+      MapPublicIpOnLaunch: True
+      Tags:
+      - Key: Name
+        Value: !Sub "${EnvironmentName}-public-a"
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref AppVPC
+      CidrBlock: !Ref publicBCidr
+      AvailabilityZone: "us-east-1b"
+      MapPublicIpOnLaunch: True
+      Tags:
+      - Key: Name
+        Value: !Sub "${EnvironmentName}-public-b"
+
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref AppVPC
+      CidrBlock: !Ref privateACidr
+      AvailabilityZone: "us-east-1a"
+      MapPublicIpOnLaunch: False
+      Tags:
+      - Key: Name
+        Value: !Sub "${EnvironmentName}-private-a"
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref AppVPC
+      CidrBlock: !Ref privateBCidr
+      AvailabilityZone: "us-east-1b"
+      MapPublicIpOnLaunch: False
+      Tags:
+      - Key: Name
+        Value: !Sub "${EnvironmentName}-private-b"
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref AppVPC
+      Tags: 
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-public-route"
+        - Key: Network
+          Value: Public
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IGWAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref VpcInternetGateway
+
+  PublicSubnetAAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnetA
+
+  PublicSubnetBAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnetB
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref AppVPC
+      Tags: 
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-private-route"
+        - Key: Network
+          Value: Private
+
+  PrivateSubnetAAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref PrivateSubnetA
+
+  PrivateSubnetBAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref PrivateSubnetB
+
+  DataBaseSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: !Sub "Subnet group for ${EnvironmentName} RDS (private subnets)"
+      SubnetIds:
+        - !Ref PrivateSubnetA
+        - !Ref PrivateSubnetB
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-rds-subnet-group"
+
+  LoadBalancerSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for ALB
+      VpcId: !Ref AppVPC
+      SecurityGroupIngress: 
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-alb-sg"
+
+  WebServerSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for web servers
+      VpcId: !Ref AppVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref LoadBalancerSG
+        # Rule 2: Allow SSH access (from parameterized CIDR)
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref SSHAccessCidr 
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-webserver-sg"
+
+  WebServerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${EnvironmentName}-WebServerRole"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: !Sub "${EnvironmentName}-WebServerSecretsPolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:appdb-secretss*"
+  
+  WebServerInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref WebServerRole
+      InstanceProfileName: !Sub "${EnvironmentName}-WebServerInstanceProfile"
+
+  DBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow MySQL access from WebServer SG
+      VpcId: !Ref AppVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref WebServerSG
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-db-sg"
+
+  AppDataBase:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: !Sub "${EnvironmentName}-db"
+      DBName: !Ref DBName
+      Engine: mysql
+      EngineVersion: "8.0.42"
+      DBInstanceClass: db.t3.micro
+      AllocatedStorage: 20
+      StorageType: gp2
+      PubliclyAccessible: false
+      DBSubnetGroupName: !Ref DataBaseSubnetGroup
+      MasterUsername: admin
+      ManageMasterUserPassword: true 
+      VPCSecurityGroups:
+        - !Ref DBSecurityGroup
+      BackupRetentionPeriod: 1
+      MultiAZ: false
+      DeletionProtection: false
+
+  DBSecret:
+    Type: AWS::SecretsManager::Secret
+    DependsOn: AppDataBase
+    Properties:
+      Name: appdb-secretss
+      Description: "Connection details for EpicBook RDS database"
+      SecretString:
+        Fn::Sub: |
+          {
+            "username": "admin",
+            "password": "{{resolve:secretsmanager:${AppDataBase.MasterUserSecret.SecretArn}:SecretString:password}}",
+            "host": "${AppDataBase.Endpoint.Address}",
+            "dbname": "${DBName}"
+          }
+
+  # Phase 1 Resource: The temporary instance used for one-time schema loading and AMI creation.
+
+  WebServerApp:
+    Type: AWS::EC2::Instance
+    DependsOn:
+      - AppDataBase
+      - DBSecret
+    Properties:
+      ImageId: !Ref GoldenAMI # Golden AMI fully configured with the exception of schema and seeding
+      InstanceType: t2.micro
+      KeyName: !Ref KeyPairName
+      SubnetId: !Ref PublicSubnetA
+      SecurityGroupIds:
+        - !Ref WebServerSG
+      IamInstanceProfile: !Ref WebServerInstanceProfile
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -e
+
+          # --- 1. SETUP ENV AND FETCH SECRETS (Running as root) ---
+          export USE_SECRETS_MANAGER=true
+          export DB_SECRET_NAME=appdb-secretss
+          export AWS_REGION=${AWS::Region}
+
+          echo "Fetching DB credentials from Secrets Manager in ${AWS_REGION}..."
+
+          # Fetch DB credentials
+          SECRET_JSON=$(aws secretsmanager get-secret-value --secret-id ${DB_SECRET_NAME} --query SecretString --output text --region ${AWS_REGION})
+          DB_USER=$(echo $SECRET_JSON | jq -r '.username')
+          DB_PASS=$(echo $SECRET_JSON | jq -r '.password')
+          DB_NAME=$(echo $SECRET_JSON | jq -r '.dbname')
+          DB_HOST=$(echo $SECRET_JSON | jq -r '.host')
+
+          # --- 2. DB WAIT AND SEEDING (Running as root) ---
+          echo "Waiting for RDS instance: $DB_HOST to become available..."
+          MAX_RETRIES=15
+          RETRY_INTERVAL=20
+          for i in $(seq 1 $MAX_RETRIES); do
+            # Use 2>/dev/null to suppress connection errors during waiting
+            if mysql -h "$DB_HOST" -u "$DB_USER" --password="$DB_PASS" -e "SELECT 1;" --silent 2>/dev/null; then
+              echo "RDS is available and accessible!"
+              break
+            fi
+            echo "Attempt $i/$MAX_RETRIES: RDS not ready or accessible. Retrying in $RETRY_INTERVAL seconds..."
+            sleep $RETRY_INTERVAL
+            if [ $i -eq $MAX_RETRIES ]; then
+              echo "Failed to connect to RDS after multiple attempts. Exiting."
+              exit 1
+            fi
+          done
+
+          echo "Loading database schema and seed data into $DB_NAME..."
+          sh -c "mysql -h \"$DB_HOST\" -u \"$DB_USER\" --password=\"$DB_PASS\" \"$DB_NAME\" < /home/ubuntu/theepicbook/db/BuyTheBook_Schema.sql"
+          sh -c "mysql -h \"$DB_HOST\" -u \"$DB_USER\" --password=\"$DB_PASS\" \"$DB_NAME\" < /home/ubuntu/theepicbook/db/author_seed.sql"
+          sh -c "mysql -h \"$DB_HOST\" -u \"$DB_USER\" --password=\"$DB_PASS\" \"$DB_NAME\" < /home/ubuntu/theepicbook/db/books_seed.sql"
+          echo "Database seeded."
+
+          # --- 3. PERSIST ENV VARS FOR UBUNTU USER ---
+          echo "Injecting persistent environment variables into /home/ubuntu/.bashrc..."
+          echo "# Environment variables for theepicbook application (Auto-injected by CFN)" >> /home/ubuntu/.bashrc
+          echo "export NODE_ENV=production" >> /home/ubuntu/.bashrc
+          echo "export USE_SECRETS_MANAGER=true" >> /home/ubuntu/.bashrc
+          echo "export DB_SECRET_NAME=appdb-secretss" >> /home/ubuntu/.bashrc
+          echo "export AWS_REGION=${AWS::Region}" >> /home/ubuntu/.bashrc
+          chown ubuntu:ubuntu /home/ubuntu/.bashrc # Set correct file ownership
+          echo ".bashrc updated."
+          
+          # --- 4. START SERVICES FOR AMI CREATION ---
+          echo "Starting configured services..."
+          systemctl restart nginx 
+
+          systemctl restart pm2-ubuntu.service 
+          echo " Setup complete. Create AMI now!"
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-WebServer-SetupInstance"
+
+  # --- ASG and Scaling Resources (Phase 2 - Production) ---
+
+  WebServerLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "${EnvironmentName}-launch-template"
+      LaunchTemplateData:
+        # IMPORTANT: AMI ID must be updated here after Phase 1 is complete!
+        ImageId: !Ref SecondaryAMI # Use the second AMI created from the webserver above
+        InstanceType: t2.micro
+        KeyName: !Ref KeyPairName
+        IamInstanceProfile:
+          Name: !Ref WebServerInstanceProfile
+        NetworkInterfaces: 
+          - DeviceIndex: 0
+            Groups:
+              - !Ref WebServerSG
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            
+            # CRITICAL: Set runtime ENV variables in the root shell. 
+            export USE_SECRETS_MANAGER=true
+            export DB_SECRET_NAME=appdb-secretss
+            export AWS_REGION=${AWS::Region}
+
+            echo "Ensuring application services are active..."
+
+            # --- 1. Start/Restart Services ---
+            systemctl restart nginx
+            systemctl restart pm2-ubuntu.service 
+
+            echo " Instance configured and services started for production."
+
+  LBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${EnvironmentName}-tg"
+      Port: 80
+      Protocol: HTTP
+      HealthCheckPath: /
+      TargetType: instance
+      VpcId: !Ref AppVPC
+
+  WebServerLB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${EnvironmentName}-lb"
+      IpAddressType: ipv4
+      Subnets:
+        - !Ref PublicSubnetA
+        - !Ref PublicSubnetB
+      SecurityGroups:
+        - !Ref LoadBalancerSG
+      Type: application
+
+  LBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref WebServerLB
+      Protocol: HTTP
+      Port: 80
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref LBTargetGroup
+    DependsOn: WebServerLB
+
+  WebServerASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub "${EnvironmentName}-webserverASG"
+      AvailabilityZones: 
+        - us-east-1a
+        - us-east-1b
+      DesiredCapacity: 1
+      MinSize: 1
+      MaxSize: 2
+      VPCZoneIdentifier: 
+        - !Ref PublicSubnetA
+        - !Ref PublicSubnetB
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WebServerLaunchTemplate
+        Version: !GetAtt WebServerLaunchTemplate.LatestVersionNumber
+      TargetGroupARNs: 
+        - !Ref LBTargetGroup
+    DependsOn: LBTargetGroup
+
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-static-bucket0989887"
+
+  CloudFrontOAI:
+    Type: AWS::CloudFront::CloudFrontOriginAccessIdentity
+    Properties:
+      CloudFrontOriginAccessIdentityConfig:
+        Comment: OAI for TheEpicBook
+
+  S3BucketPolicyAllowOAI:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref S3Bucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudFrontGetObject
+            Effect: Allow
+            Principal:
+              CanonicalUser: !GetAtt CloudFrontOAI.S3CanonicalUserId
+            Action:
+              - "s3:GetObject"
+            Resource:
+              - !Sub "${S3Bucket.Arn}/*"
+
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    DependsOn:
+      - S3BucketPolicyAllowOAI
+      - CloudFrontCertificate
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Aliases:
+          - "hendrix.it.com"
+        Origins:
+          # Origin A: S3 for Static Content
+          - Id: S3Origin
+            DomainName: !GetAtt S3Bucket.RegionalDomainName
+            S3OriginConfig:
+              OriginAccessIdentity: !Sub "origin-access-identity/cloudfront/${CloudFrontOAI}"
+          # Origin B: ALB for Dynamic Content (Node.js App)
+          - Id: ALBOrigin
+            DomainName: !GetAtt WebServerLB.DNSName 
+            CustomOriginConfig:
+              HTTPPort: 80
+              HTTPSPort: 443
+              OriginProtocolPolicy: http-only 
+              OriginSSLProtocols:
+                - TLSv1.2
+        DefaultCacheBehavior:
+          TargetOriginId: ALBOrigin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+            - PUT
+            - POST
+            - PATCH
+            - DELETE
+          CachedMethods:
+            - GET
+            - HEAD
+          ForwardedValues:
+            QueryString: true
+            Cookies:
+              Forward: all
+          Compress: true
+          MinTTL: 0
+          DefaultTTL: 0
+          MaxTTL: 0
+        CacheBehaviors:
+          - PathPattern: "/assets/*"
+            TargetOriginId: S3Origin
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods:
+              - GET
+              - HEAD
+              - OPTIONS
+            CachedMethods:
+              - GET
+              - HEAD
+            ForwardedValues:
+              QueryString: false
+              Cookies:
+                Forward: none
+            Compress: true
+            MinTTL: 86400
+            DefaultTTL: 259200
+            MaxTTL: 31536000
+        DefaultRootObject: ""
+        ViewerCertificate:
+          AcmCertificateArn: !Ref CloudFrontCertificate
+          SslSupportMethod: sni-only
+          MinimumProtocolVersion: TLSv1.2_2021
+
+  CloudFrontCertificate:
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName: hendrix.it.com
+      ValidationMethod: DNS
+      DomainValidationOptions:
+        - DomainName: hendrix.it.com
+          HostedZoneId: !Ref AppHostedZone 
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-acm"
+
+  AppResourceRecord:
+    Type: AWS::Route53::RecordSet
+    DependsOn: CloudFrontDistribution 
+    Properties:
+      HostedZoneId: !Ref AppHostedZone
+      Name: hendrix.it.com.
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt CloudFrontDistribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2
+
+  MonitoringTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${EnvironmentName}-Monitoring-Topic"
+      DisplayName: "Monitoring Alerts"
+      Subscription:
+        - Protocol: email
+          Endpoint: miracleosita355@gmail.com #ensure to replace email and check for confirmation email from AWS
+
+  HighCpuAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${EnvironmentName}-High-CPU-Alert"
+      AlarmDescription: "Alarm when ASG average CPU utilization exceeds 80% for 10 minutes"
+      Namespace: AWS/EC2
+      MetricName: CPUUtilization
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref WebServerASG
+      AlarmActions:
+        - !Ref MonitoringTopic
+      OKActions:
+        - !Ref MonitoringTopic
