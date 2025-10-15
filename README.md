@@ -17,7 +17,7 @@ I deployed a two-tier architecture on AWS, placed in a **custom VPC** with prope
 The Node.js app cloned from GitHub wasn't production-ready as crucial details like database credentials were **hardcoded**. The core solution was to modify the application code to be **stateless and secure** by fetching credentials dynamically at runtime. This required updating the application to use the **AWS Secrets Manager SDK** to retrieve database credentials. The configured version of the app was then used to create a **Golden AMI**, which ensures every new EC2 instance launched by the Auto Scaling Group is immediately production-ready. This approach requires an **IAM Role** attached to the EC2 instances to grant them permission to access Secrets Manager.
 
 
-## Behind The Epic Book Project
+## Behind This Two-Tier Project
 
 What started as a simple lift and shift deployment became a deep dive into real world cloud engineering. This project pushed me beyond tutorials and into production level problem solving; configuring EC2 launch templates, RDS integration, Secrets Manager, Auto Scaling, and Load Balancing from scratch, while also keeping best practice in mind. Every failed deployment and every connection error taught me how AWS truly works under the hood.
 
